@@ -8,15 +8,16 @@ use eframe::egui::{
 use crate::{
     document::{Document, MAX_HIGHLIGHT_LINE_BYTES, Position, advance},
     highlighter::{HighlightResult, HighlightWorker, HighlightedLine},
+    theme::{ACTIVE_LINE, CURSOR, EDITOR_MUTED, EDITOR_TEXT, SELECTION},
 };
 
 const FONT_SIZE: f32 = 14.0;
 const ROW_HEIGHT: f32 = 21.0;
-const TEXT_COLOR: Color32 = Color32::from_rgb(210, 216, 224);
-const MUTED_COLOR: Color32 = Color32::from_rgb(91, 103, 116);
-const CURSOR_COLOR: Color32 = Color32::from_rgb(239, 185, 92);
-const SELECTION_COLOR: Color32 = Color32::from_rgb(42, 74, 103);
-const ACTIVE_LINE_COLOR: Color32 = Color32::from_rgb(24, 30, 38);
+const TEXT_COLOR: Color32 = EDITOR_TEXT;
+const MUTED_COLOR: Color32 = EDITOR_MUTED;
+const CURSOR_COLOR: Color32 = CURSOR;
+const SELECTION_COLOR: Color32 = SELECTION;
+const ACTIVE_LINE_COLOR: Color32 = ACTIVE_LINE;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HighlightKey {
@@ -472,7 +473,13 @@ pub fn show(
                     }
                 })
                 .collect();
-            worker.request(document.id, document.snapshot(), key.range.start, lines);
+            worker.request(
+                document.id,
+                document.path.clone(),
+                document.revision,
+                key.range.start,
+                lines,
+            );
             state.highlight_key = Some(key);
         }
     }

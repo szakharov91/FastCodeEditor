@@ -1,6 +1,6 @@
 use std::{fs, io::Write};
 
-use fast_code_editor::document::{Document, Position, save_rope};
+use fast_code_editor::document::{Document, Position, save_snapshot};
 
 #[test]
 fn unicode_edit_undo_redo_and_atomic_save() {
@@ -18,7 +18,7 @@ fn unicode_edit_undo_redo_and_atomic_save() {
     assert!(document.line(1).ends_with("// ✓"));
 
     let snapshot = document.snapshot();
-    let bytes = save_rope(&snapshot, file.path()).unwrap();
+    let bytes = save_snapshot(&snapshot, file.path()).unwrap();
     document.mark_saved(bytes);
     assert!(!document.dirty);
     assert!(fs::read_to_string(file.path()).unwrap().contains("// ✓"));

@@ -1,4 +1,9 @@
-use std::{ops::Range, path::Path, sync::Arc, thread};
+use std::{
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+};
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use eframe::egui::{self, Color32};
@@ -8,7 +13,7 @@ use syntect::{
     parsing::SyntaxSet,
 };
 
-use crate::document::{DocumentSnapshot, MAX_HIGHLIGHT_LINE_BYTES};
+use crate::document::MAX_HIGHLIGHT_LINE_BYTES;
 
 #[derive(Clone, Debug)]
 pub struct HighlightSpan {
@@ -30,7 +35,8 @@ pub struct HighlightResult {
 
 struct HighlightRequest {
     document_id: u64,
-    snapshot: DocumentSnapshot,
+    path: PathBuf,
+    revision: u64,
     start_line: usize,
     lines: Vec<String>,
 }
@@ -54,7 +60,7 @@ impl HighlightWorker {
                 let theme = Arc::new(
                     themes
                         .themes
-                        .get("base16-eighties.dark")
+                        .get("base16-ocean.dark")
                         .or_else(|| themes.themes.values().next())
                         .expect("syntect default themes are not empty")
                         .clone(),
@@ -84,13 +90,15 @@ impl HighlightWorker {
     pub fn request(
         &self,
         document_id: u64,
-        snapshot: DocumentSnapshot,
+        path: PathBuf,
+        revision: u64,
         start_line: usize,
         lines: Vec<String>,
     ) {
         let _ = self.request_tx.send(HighlightRequest {
             document_id,
-            snapshot,
+            path,
+            revision,
             start_line,
             lines,
         });
@@ -102,7 +110,7 @@ impl HighlightWorker {
 }
 
 fn highlight(request: HighlightRequest, syntax_set: &SyntaxSet, theme: &Theme) -> HighlightResult {
-    let syntax = syntax_for_path(syntax_set, &request.snapshot.path);
+    let syntax = syntax_for_path(syntax_set, &request.path);
     let language = syntax.map_or_else(|| "Plain Text".to_owned(), |syntax| syntax.name.clone());
     let mut highlighter = syntax.map(|syntax| HighlightLines::new(syntax, theme));
     let mut lines = Vec::with_capacity(request.lines.len());
@@ -139,7 +147,7 @@ fn highlight(request: HighlightRequest, syntax_set: &SyntaxSet, theme: &Theme) -
 
     HighlightResult {
         document_id: request.document_id,
-        revision: request.snapshot.revision,
+        revision: request.revision,
         start_line: request.start_line,
         language,
         lines,

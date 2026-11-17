@@ -4,13 +4,13 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
-use memmap2::Mmap;
 use ropey::Rope;
+
+use crate::piece_table::PieceTable;
 
 pub const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 pub const HIGHLIGHT_FILE_LIMIT: u64 = 256 * 1024 * 1024;
@@ -38,70 +38,9 @@ pub struct Edit {
 }
 
 #[derive(Clone)]
-struct MappedFile {
-    data: Arc<Mmap>,
-    line_starts: Arc<Vec<usize>>,
-    line_char_lengths: Arc<Vec<usize>>,
-}
-
-impl MappedFile {
-    fn open(file: &File) -> Result<Self> {
-        // SAFETY: the editor never mutates or truncates an open file itself. External
-        // truncation while a mapping is active is a platform-level I/O hazard, so the
-        // file watcher/reload workflow must replace the mapping before further reads.
-        let data = unsafe { Mmap::map(file)? };
-        let mut line_starts = Vec::with_capacity(data.len() / 48 + 1);
-        line_starts.push(0);
-        for newline in memchr::memchr_iter(b'\n', &data) {
-            line_starts.push(newline + 1);
-        }
-
-        let mut line_char_lengths = Vec::with_capacity(line_starts.len());
-        for line in 0..line_starts.len() {
-            let start = line_starts[line];
-            let mut end = line_starts.get(line + 1).copied().unwrap_or(data.len());
-            if end > start && data[end - 1] == b'\n' {
-                end -= 1;
-            }
-            if end > start && data[end - 1] == b'\r' {
-                end -= 1;
-            }
-            let text = String::from_utf8_lossy(&data[start..end]);
-            line_char_lengths.push(text.chars().count());
-        }
-
-        Ok(Self {
-            data: Arc::new(data),
-            line_starts: Arc::new(line_starts),
-            line_char_lengths: Arc::new(line_char_lengths),
-        })
-    }
-
-    fn len_lines(&self) -> usize {
-        self.line_starts.len()
-    }
-
-    fn line(&self, line: usize) -> Cow<'_, str> {
-        let start = self.line_starts[line];
-        let mut end = self
-            .line_starts
-            .get(line + 1)
-            .copied()
-            .unwrap_or(self.data.len());
-        if end > start && self.data[end - 1] == b'\n' {
-            end -= 1;
-        }
-        if end > start && self.data[end - 1] == b'\r' {
-            end -= 1;
-        }
-        String::from_utf8_lossy(&self.data[start..end])
-    }
-}
-
-#[derive(Clone)]
 enum Storage {
     Rope(Rope),
-    Mapped(MappedFile),
+    Pieces(PieceTable),
 }
 
 #[derive(Clone)]
@@ -115,14 +54,14 @@ impl DocumentSnapshot {
     pub fn len_lines(&self) -> usize {
         match &self.storage {
             Storage::Rope(rope) => rope.len_lines(),
-            Storage::Mapped(mapped) => mapped.len_lines(),
+            Storage::Pieces(pieces) => pieces.len_lines(),
         }
     }
 
     pub fn line(&self, line: usize) -> Cow<'_, str> {
         match &self.storage {
             Storage::Rope(rope) => trim_line_ending(rope.line(line).to_string()).into(),
-            Storage::Mapped(mapped) => mapped.line(line),
+            Storage::Pieces(pieces) => pieces.line(line).into(),
         }
     }
 }
@@ -138,6 +77,7 @@ pub struct Document {
     pub load_time: Duration,
     undo: Vec<Edit>,
     redo: Vec<Edit>,
+    last_edit: Instant,
 }
 
 impl Document {
@@ -162,10 +102,10 @@ impl Document {
         drop(sample_file);
 
         let byte_len = metadata.len();
-        let use_mapping = byte_len >= large_file_threshold && byte_len > 0;
-        let storage = if use_mapping {
+        let use_pieces = byte_len >= large_file_threshold && byte_len > 0;
+        let storage = if use_pieces {
             let file = File::open(path)?;
-            Storage::Mapped(MappedFile::open(&file)?)
+            Storage::Pieces(PieceTable::open(&file)?)
         } else {
             let file = File::open(path)?;
             match Rope::from_reader(BufReader::with_capacity(1024 * 1024, file)) {
@@ -184,11 +124,12 @@ impl Document {
             storage,
             revision: 0,
             dirty: false,
-            read_only: use_mapping,
+            read_only: false,
             byte_len,
             load_time: started.elapsed(),
             undo: Vec::new(),
             redo: Vec::new(),
+            last_edit: Instant::now(),
         })
     }
 
@@ -200,6 +141,40 @@ impl Document {
         }
     }
 
+    pub fn compaction_snapshot(&self) -> Option<DocumentSnapshot> {
+        let Storage::Pieces(pieces) = &self.storage else {
+            return None;
+        };
+        (pieces.needs_compaction() && self.last_edit.elapsed() >= Duration::from_millis(1_500))
+            .then(|| self.snapshot())
+    }
+
+    pub fn compact_snapshot(snapshot: &DocumentSnapshot) -> Result<DocumentSnapshot> {
+        let Storage::Pieces(pieces) = &snapshot.storage else {
+            bail!("Компактификация доступна только для piece table");
+        };
+        Ok(DocumentSnapshot {
+            storage: Storage::Pieces(pieces.compact()?),
+            path: snapshot.path.clone(),
+            revision: snapshot.revision,
+        })
+    }
+
+    pub fn apply_compaction(&mut self, snapshot: DocumentSnapshot) -> bool {
+        if snapshot.revision != self.revision || !matches!(&snapshot.storage, Storage::Pieces(_)) {
+            return false;
+        }
+        self.storage = snapshot.storage;
+        true
+    }
+
+    pub fn fragment_count(&self) -> Option<usize> {
+        match &self.storage {
+            Storage::Rope(_) => None,
+            Storage::Pieces(pieces) => Some(pieces.fragment_count()),
+        }
+    }
+
     pub fn file_name(&self) -> Cow<'_, str> {
         self.path
             .file_name()
@@ -207,17 +182,24 @@ impl Document {
             .unwrap_or_else(|| self.path.to_string_lossy())
     }
 
+    pub fn backend_label(&self) -> &'static str {
+        match &self.storage {
+            Storage::Rope(_) => "ROPE",
+            Storage::Pieces(_) => "PIECE TABLE · mmap",
+        }
+    }
+
     pub fn len_lines(&self) -> usize {
         match &self.storage {
             Storage::Rope(rope) => rope.len_lines(),
-            Storage::Mapped(mapped) => mapped.len_lines(),
+            Storage::Pieces(pieces) => pieces.len_lines(),
         }
     }
 
     pub fn line(&self, line: usize) -> Cow<'_, str> {
         match &self.storage {
             Storage::Rope(rope) => trim_line_ending(rope.line(line).to_string()).into(),
-            Storage::Mapped(mapped) => mapped.line(line),
+            Storage::Pieces(pieces) => pieces.line(line).into(),
         }
     }
 
@@ -234,7 +216,7 @@ impl Document {
                 }
                 len
             }
-            Storage::Mapped(mapped) => mapped.line_char_lengths[line],
+            Storage::Pieces(pieces) => pieces.line_len_chars(line),
         }
     }
 
@@ -244,12 +226,7 @@ impl Document {
         let end = min(max(end, start), line_len);
         match &self.storage {
             Storage::Rope(rope) => rope.line(line).slice(start..end).to_string(),
-            Storage::Mapped(_) => self
-                .line(line)
-                .chars()
-                .skip(start)
-                .take(end - start)
-                .collect(),
+            Storage::Pieces(pieces) => pieces.line_slice_chars(line, start, end),
         }
     }
 
@@ -274,6 +251,7 @@ impl Document {
             return None;
         }
         self.replace_raw(start, end, text);
+        self.byte_len = self.byte_len.saturating_sub(deleted.len() as u64) + text.len() as u64;
         let edit = Edit {
             start,
             end,
@@ -289,19 +267,26 @@ impl Document {
     }
 
     fn replace_raw(&mut self, start: Position, end: Position, text: &str) {
-        let Storage::Rope(rope) = &mut self.storage else {
-            return;
-        };
-        let start_char = rope.line_to_char(start.line) + start.column;
-        let end_char = rope.line_to_char(end.line) + end.column;
-        if end_char > start_char {
-            rope.remove(start_char..end_char);
-        }
-        if !text.is_empty() {
-            rope.insert(start_char, text);
+        match &mut self.storage {
+            Storage::Rope(rope) => {
+                let start_char = rope.line_to_char(start.line) + start.column;
+                let end_char = rope.line_to_char(end.line) + end.column;
+                if end_char > start_char {
+                    rope.remove(start_char..end_char);
+                }
+                if !text.is_empty() {
+                    rope.insert(start_char, text);
+                }
+            }
+            Storage::Pieces(pieces) => {
+                let start_byte = pieces.position_to_byte(start.line, start.column);
+                let end_byte = pieces.position_to_byte(end.line, end.column);
+                pieces.replace(start_byte, end_byte, text);
+            }
         }
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
+        self.last_edit = Instant::now();
     }
 
     pub fn undo(&mut self) -> Option<Position> {
@@ -309,6 +294,8 @@ impl Document {
         let position = edit.start;
         let inserted_end = advance(edit.start, &edit.inserted);
         self.replace_raw(edit.start, inserted_end, &edit.deleted);
+        self.byte_len =
+            self.byte_len.saturating_sub(edit.inserted.len() as u64) + edit.deleted.len() as u64;
         self.redo.push(edit);
         Some(position)
     }
@@ -316,6 +303,8 @@ impl Document {
     pub fn redo(&mut self) -> Option<Position> {
         let edit = self.redo.pop()?;
         self.replace_raw(edit.start, edit.end, &edit.inserted);
+        self.byte_len =
+            self.byte_len.saturating_sub(edit.deleted.len() as u64) + edit.inserted.len() as u64;
         let position = advance(edit.start, &edit.inserted);
         self.undo.push(edit);
         Some(position)
@@ -368,10 +357,7 @@ pub fn advance(mut position: Position, text: &str) -> Position {
     position
 }
 
-pub fn save_rope(snapshot: &DocumentSnapshot, path: &Path) -> Result<u64> {
-    let Storage::Rope(rope) = &snapshot.storage else {
-        bail!("Файл в режиме memory mapping доступен только для чтения");
-    };
+pub fn save_snapshot(snapshot: &DocumentSnapshot, path: &Path) -> Result<u64> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     if let Ok(metadata) = fs::metadata(path) {
@@ -381,7 +367,10 @@ pub fn save_rope(snapshot: &DocumentSnapshot, path: &Path) -> Result<u64> {
     }
     {
         let mut writer = BufWriter::with_capacity(1024 * 1024, temporary.as_file_mut());
-        rope.write_to(&mut writer)?;
+        match &snapshot.storage {
+            Storage::Rope(rope) => rope.write_to(&mut writer)?,
+            Storage::Pieces(pieces) => pieces.write_to(&mut writer)?,
+        }
         writer.flush()?;
     }
     temporary.as_file().sync_all()?;
@@ -435,19 +424,105 @@ mod tests {
     }
 
     #[test]
-    fn mapped_file_is_indexed_without_rope() {
+    fn piece_table_file_is_editable_and_undoable() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         for line in 0..10_000 {
             writeln!(file, "line-{line}-привет").unwrap();
         }
         file.flush().unwrap();
-        let document = Document::open_with_limit(file.path(), 2, 1).unwrap();
+        let mut document = Document::open_with_limit(file.path(), 2, 1).unwrap();
 
-        assert!(document.read_only);
+        assert!(!document.read_only);
+        assert_eq!(document.backend_label(), "PIECE TABLE · mmap");
         assert_eq!(document.len_lines(), 10_001);
         assert_eq!(document.line(9_999), "line-9999-привет");
         assert_eq!(document.line_len_chars(9_999), 16);
         assert_eq!(document.line_slice_chars(9_999, 5, 10), "9999-");
+
+        document
+            .replace(Position::new(9_999, 0), Position::new(9_999, 0), "EDIT: ")
+            .unwrap();
+        document
+            .replace(Position::new(1, 4), Position::new(2, 3), "\nNEW LINE\n")
+            .unwrap();
+        assert_eq!(document.line(10_000), "EDIT: line-9999-привет");
+        assert!(document.dirty);
+        assert_eq!(document.revision, 2);
+
+        document.undo().unwrap();
+        document.undo().unwrap();
+        assert_eq!(document.line(9_999), "line-9999-привет");
+        document.redo().unwrap();
+        document.redo().unwrap();
+        assert_eq!(document.line(10_000), "EDIT: line-9999-привет");
+    }
+
+    #[test]
+    fn piece_snapshot_is_stable_during_later_edits() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "before").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open_with_limit(file.path(), 4, 1).unwrap();
+        document
+            .replace(Position::new(0, 6), Position::new(0, 6), " snapshot")
+            .unwrap();
+        let snapshot = document.snapshot();
+        document
+            .replace(Position::new(0, 15), Position::new(0, 15), " later")
+            .unwrap();
+
+        let output = tempfile::NamedTempFile::new().unwrap();
+        save_snapshot(&snapshot, output.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(output.path()).unwrap(),
+            "before snapshot"
+        );
+        assert_eq!(document.line(0), "before snapshot later");
+    }
+
+    #[test]
+    fn compaction_preserves_history_and_dirty_state() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "before").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open_with_limit(file.path(), 5, 1).unwrap();
+        document
+            .replace(Position::new(0, 6), Position::new(0, 6), " first")
+            .unwrap();
+        document
+            .replace(Position::new(0, 12), Position::new(0, 12), " second")
+            .unwrap();
+
+        let compacted = Document::compact_snapshot(&document.snapshot()).unwrap();
+        assert!(document.apply_compaction(compacted));
+        assert_eq!(document.fragment_count(), Some(1));
+        assert_eq!(document.line(0), "before first second");
+        assert!(document.dirty);
+
+        document.undo().unwrap();
+        assert_eq!(document.line(0), "before first");
+        document.redo().unwrap();
+        assert_eq!(document.line(0), "before first second");
+    }
+
+    #[test]
+    fn stale_compaction_cannot_overwrite_newer_edits() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "before").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open_with_limit(file.path(), 6, 1).unwrap();
+        document
+            .replace(Position::new(0, 6), Position::new(0, 6), " stable")
+            .unwrap();
+        let compacted = Document::compact_snapshot(&document.snapshot()).unwrap();
+        document
+            .replace(Position::new(0, 13), Position::new(0, 13), " newer")
+            .unwrap();
+
+        assert!(!document.apply_compaction(compacted));
+        assert_eq!(document.line(0), "before stable newer");
+        assert_eq!(document.revision, 2);
+        assert!(document.dirty);
     }
 
     #[test]

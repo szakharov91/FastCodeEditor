@@ -7,12 +7,10 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use eframe::egui::{
-    self, Align2, Color32, Context, Key, Modifiers, RichText, ScrollArea, TextEdit,
-};
+use eframe::egui::{self, Align2, Context, Key, Modifiers, RichText, ScrollArea, TextEdit};
 
 use crate::{
-    document::{Document, DocumentSnapshot, Position, save_rope},
+    document::{Document, DocumentSnapshot, Position, save_snapshot},
     editor::{self, EditorState},
     highlighter::{HighlightWorker, language_label},
     project::{Project, is_probably_text},
@@ -33,6 +31,11 @@ enum AppEvent {
         path: PathBuf,
         update_path: bool,
         result: Result<u64, String>,
+    },
+    Compacted {
+        document_id: u64,
+        revision: u64,
+        result: Result<DocumentSnapshot, String>,
     },
     SearchResults {
         document_id: u64,
@@ -77,6 +80,7 @@ pub struct FastCodeEditor {
     highlighter: HighlightWorker,
     pending_loads: usize,
     saving: HashSet<u64>,
+    compacting: HashSet<u64>,
     close_after_save: HashSet<u64>,
     close_requested: Option<u64>,
     show_sidebar: bool,
@@ -89,13 +93,7 @@ pub struct FastCodeEditor {
 impl FastCodeEditor {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         let (event_tx, event_rx) = unbounded();
-        let mut style = (*creation_context.egui_ctx.style()).clone();
-        style.visuals = egui::Visuals::dark();
-        style.visuals.panel_fill = Color32::from_rgb(15, 18, 23);
-        style.visuals.window_fill = Color32::from_rgb(20, 24, 30);
-        style.visuals.extreme_bg_color = Color32::from_rgb(11, 14, 18);
-        style.visuals.selection.bg_fill = Color32::from_rgb(42, 74, 103);
-        creation_context.egui_ctx.set_style(style);
+        crate::theme::apply(&creation_context.egui_ctx);
 
         Self {
             documents: Vec::new(),
@@ -108,6 +106,7 @@ impl FastCodeEditor {
             highlighter: HighlightWorker::new(&creation_context.egui_ctx),
             pending_loads: 0,
             saving: HashSet::new(),
+            compacting: HashSet::new(),
             close_after_save: HashSet::new(),
             close_requested: None,
             show_sidebar: true,
@@ -233,7 +232,7 @@ impl FastCodeEditor {
         else {
             return;
         };
-        if self.saving.contains(&document_id) {
+        if self.saving.contains(&document_id) || self.compacting.contains(&document_id) {
             return;
         }
         let snapshot = open.document.snapshot();
@@ -245,7 +244,7 @@ impl FastCodeEditor {
         thread::Builder::new()
             .name("fce-file-save".into())
             .spawn(move || {
-                let result = save_rope(&snapshot, &path).map_err(|error| format!("{error:#}"));
+                let result = save_snapshot(&snapshot, &path).map_err(|error| format!("{error:#}"));
                 let _ = sender.send(AppEvent::Saved {
                     document_id,
                     revision,
@@ -256,6 +255,51 @@ impl FastCodeEditor {
                 context.request_repaint();
             })
             .expect("failed to start file saver");
+    }
+
+    fn maybe_start_compaction(&mut self, context: &Context) -> bool {
+        let mut pending = false;
+        let candidates: Vec<_> = self
+            .documents
+            .iter()
+            .filter_map(|open| {
+                let document = &open.document;
+                let fragmented = document.fragment_count().is_some_and(|count| {
+                    count >= crate::piece_table::COMPACTION_FRAGMENT_THRESHOLD
+                });
+                pending |= fragmented;
+                if !fragmented
+                    || self.saving.contains(&document.id)
+                    || self.compacting.contains(&document.id)
+                {
+                    return None;
+                }
+                document
+                    .compaction_snapshot()
+                    .map(|snapshot| (document.id, snapshot))
+            })
+            .collect();
+
+        for (document_id, snapshot) in candidates {
+            let revision = snapshot.revision;
+            self.compacting.insert(document_id);
+            let sender = self.event_tx.clone();
+            let context = context.clone();
+            thread::Builder::new()
+                .name("fce-compaction".into())
+                .spawn(move || {
+                    let result =
+                        Document::compact_snapshot(&snapshot).map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(AppEvent::Compacted {
+                        document_id,
+                        revision,
+                        result,
+                    });
+                    context.request_repaint();
+                })
+                .expect("failed to start piece table compaction");
+        }
+        pending
     }
 
     fn request_close(&mut self, document_id: u64) {
@@ -338,15 +382,11 @@ impl FastCodeEditor {
                     match result {
                         Ok(document) => {
                             let message = format!(
-                                "{}: {} строк за {:.1} мс{}",
+                                "{}: {} строк за {:.1} мс, {}",
                                 document.file_name(),
                                 document.len_lines(),
                                 document.load_time.as_secs_f64() * 1000.0,
-                                if document.read_only {
-                                    ", memory mapping / только чтение"
-                                } else {
-                                    ""
-                                }
+                                document.backend_label()
                             );
                             self.documents.push(OpenDocument {
                                 document,
@@ -392,6 +432,31 @@ impl FastCodeEditor {
                         Err(error) => {
                             self.close_after_save.remove(&document_id);
                             self.set_error(error);
+                        }
+                    }
+                }
+                AppEvent::Compacted {
+                    document_id,
+                    revision,
+                    result,
+                } => {
+                    self.compacting.remove(&document_id);
+                    match result {
+                        Ok(snapshot) => {
+                            let applied = self
+                                .documents
+                                .iter_mut()
+                                .find(|open| open.document.id == document_id)
+                                .is_some_and(|open| {
+                                    open.document.revision == revision
+                                        && open.document.apply_compaction(snapshot)
+                                });
+                            if applied {
+                                self.set_status("Фрагменты документа оптимизированы");
+                            }
+                        }
+                        Err(error) => {
+                            self.set_error(format!("Ошибка компактификации: {error}"));
                         }
                     }
                 }
@@ -742,25 +807,25 @@ impl FastCodeEditor {
                     ui.label(format!("{} строк", document.len_lines()));
                     ui.separator();
                     ui.label(format_size(document.byte_len));
-                    if document.read_only {
-                        ui.separator();
-                        ui.label(
-                            RichText::new("READ ONLY · mmap")
-                                .color(Color32::from_rgb(239, 185, 92)),
-                        );
-                    }
+                    ui.separator();
+                    ui.label(RichText::new(document.backend_label()).color(crate::theme::CYAN));
                     if self.saving.contains(&document.id) {
                         ui.separator();
                         ui.spinner();
                         ui.label("Сохранение");
                     }
+                    if self.compacting.contains(&document.id) {
+                        ui.separator();
+                        ui.spinner();
+                        ui.label("Оптимизация фрагментов");
+                    }
                 }
                 if let Some(status) = &self.status {
                     ui.separator();
                     ui.label(RichText::new(&status.text).color(if status.error {
-                        Color32::from_rgb(239, 112, 112)
+                        crate::theme::ERROR
                     } else {
-                        Color32::from_rgb(143, 154, 166)
+                        crate::theme::MUTED
                     }));
                 }
             });
@@ -909,6 +974,10 @@ impl FastCodeEditor {
 }
 
 impl eframe::App for FastCodeEditor {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn update(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         if let Some(path) = self.initial_path.take() {
             self.open_path(path, context);
@@ -942,15 +1011,17 @@ impl eframe::App for FastCodeEditor {
                         self.open_folder_dialog(context);
                     }
                     ui.add_space(24.0);
-                    ui.label("Файлы от 64 МиБ открываются через mmap в режиме чтения");
+                    ui.label("Файлы от 64 МиБ редактируются через piece table поверх mmap");
                 });
             }
         });
 
         self.show_quick_open(context);
         self.show_close_confirmation(context);
+        let compaction_pending = self.maybe_start_compaction(context);
         if self.pending_loads > 0
             || !self.saving.is_empty()
+            || !self.compacting.is_empty()
             || self.search.searching
             || self
                 .project
@@ -958,6 +1029,8 @@ impl eframe::App for FastCodeEditor {
                 .is_some_and(|project| project.scanning)
         {
             context.request_repaint_after(Duration::from_millis(32));
+        } else if compaction_pending {
+            context.request_repaint_after(Duration::from_millis(250));
         }
     }
 }
