@@ -1,0 +1,33 @@
+[package]
+name = "fast-code-editor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A native Rust code editor built for large projects and huge text files"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+eframe = "0.32"
+ignore = "0.4"
+memchr = "2.7"
+memmap2 = "0.9"
+rfd = "0.18"
+ropey = "1.6"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-onig"] }
+tempfile = "3.23"
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-onig"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
