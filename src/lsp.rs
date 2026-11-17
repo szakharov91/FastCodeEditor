@@ -10,8 +10,9 @@ use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, select, unbounded};
 use eframe::egui;
 use lsp_types::{
-    CompletionItem, CompletionResponse, Diagnostic, GotoDefinitionResponse, Hover, Location,
-    PublishDiagnosticsParams, WorkspaceEdit,
+    CodeAction, CodeActionOrCommand, CodeActionResponse, Command as LspCommand, CompletionItem,
+    CompletionResponse, Diagnostic, GotoDefinitionResponse, Hover, Location,
+    PublishDiagnosticsParams, TextEdit, WorkspaceEdit,
 };
 use serde_json::{Value, json};
 use url::Url;
@@ -76,6 +77,24 @@ pub enum LspEvent {
         document_id: u64,
         revision: u64,
         edit: Option<WorkspaceEdit>,
+    },
+    Formatting {
+        document_id: u64,
+        revision: u64,
+        edits: Vec<TextEdit>,
+    },
+    CodeActions {
+        document_id: u64,
+        revision: u64,
+        actions: Vec<CodeActionOrCommand>,
+    },
+    CodeActionResolved {
+        document_id: u64,
+        revision: u64,
+        action: Box<CodeAction>,
+    },
+    CommandExecuted {
+        document_id: u64,
     },
 }
 
@@ -235,6 +254,29 @@ enum ManagerCommand {
         position: lsp_types::Position,
         new_name: String,
     },
+    Formatting {
+        document_id: u64,
+        revision: u64,
+        uri: Url,
+        tab_size: u32,
+        insert_spaces: bool,
+    },
+    CodeActions {
+        document_id: u64,
+        revision: u64,
+        uri: Url,
+        range: lsp_types::Range,
+        diagnostics: Vec<Diagnostic>,
+    },
+    ResolveCodeAction {
+        document_id: u64,
+        revision: u64,
+        action: CodeAction,
+    },
+    ExecuteCommand {
+        document_id: u64,
+        command: LspCommand,
+    },
     Shutdown,
 }
 
@@ -278,6 +320,29 @@ enum ServerMessage {
         uri: Url,
         position: lsp_types::Position,
         new_name: String,
+    },
+    Formatting {
+        document_id: u64,
+        revision: u64,
+        uri: Url,
+        tab_size: u32,
+        insert_spaces: bool,
+    },
+    CodeActions {
+        document_id: u64,
+        revision: u64,
+        uri: Url,
+        range: lsp_types::Range,
+        diagnostics: Vec<Diagnostic>,
+    },
+    ResolveCodeAction {
+        document_id: u64,
+        revision: u64,
+        action: CodeAction,
+    },
+    ExecuteCommand {
+        document_id: u64,
+        command: LspCommand,
     },
     Shutdown,
 }
@@ -403,6 +468,54 @@ impl LspWorker {
                 new_name,
             });
         }
+    }
+
+    pub fn request_formatting(&self, document: &Document) {
+        if let Some(uri) = document_uri(document) {
+            let _ = self.command_tx.send(ManagerCommand::Formatting {
+                document_id: document.id,
+                revision: document.revision,
+                uri,
+                tab_size: 4,
+                insert_spaces: true,
+            });
+        }
+    }
+
+    pub fn request_code_actions(
+        &self,
+        document: &Document,
+        start: Position,
+        end: Position,
+        diagnostics: Vec<Diagnostic>,
+    ) {
+        if let Some(uri) = document_uri(document) {
+            let _ = self.command_tx.send(ManagerCommand::CodeActions {
+                document_id: document.id,
+                revision: document.revision,
+                uri,
+                range: lsp_types::Range {
+                    start: document.to_lsp_position(start),
+                    end: document.to_lsp_position(end),
+                },
+                diagnostics,
+            });
+        }
+    }
+
+    pub fn resolve_code_action(&self, document: &Document, action: CodeAction) {
+        let _ = self.command_tx.send(ManagerCommand::ResolveCodeAction {
+            document_id: document.id,
+            revision: document.revision,
+            action,
+        });
+    }
+
+    pub fn execute_command(&self, document_id: u64, command: LspCommand) {
+        let _ = self.command_tx.send(ManagerCommand::ExecuteCommand {
+            document_id,
+            command,
+        });
     }
 
     pub fn try_recv(&self) -> Option<LspEvent> {
@@ -554,6 +667,64 @@ fn run_manager(receiver: Receiver<ManagerCommand>, sink: EventSink) {
                     });
                 }
             }
+            ManagerCommand::Formatting {
+                document_id,
+                revision,
+                uri,
+                tab_size,
+                insert_spaces,
+            } => {
+                if let Some(sender) = route_sender(&routes, &servers, document_id) {
+                    let _ = sender.send(ServerMessage::Formatting {
+                        document_id,
+                        revision,
+                        uri,
+                        tab_size,
+                        insert_spaces,
+                    });
+                }
+            }
+            ManagerCommand::CodeActions {
+                document_id,
+                revision,
+                uri,
+                range,
+                diagnostics,
+            } => {
+                if let Some(sender) = route_sender(&routes, &servers, document_id) {
+                    let _ = sender.send(ServerMessage::CodeActions {
+                        document_id,
+                        revision,
+                        uri,
+                        range,
+                        diagnostics,
+                    });
+                }
+            }
+            ManagerCommand::ResolveCodeAction {
+                document_id,
+                revision,
+                action,
+            } => {
+                if let Some(sender) = route_sender(&routes, &servers, document_id) {
+                    let _ = sender.send(ServerMessage::ResolveCodeAction {
+                        document_id,
+                        revision,
+                        action,
+                    });
+                }
+            }
+            ManagerCommand::ExecuteCommand {
+                document_id,
+                command,
+            } => {
+                if let Some(sender) = route_sender(&routes, &servers, document_id) {
+                    let _ = sender.send(ServerMessage::ExecuteCommand {
+                        document_id,
+                        command,
+                    });
+                }
+            }
             ManagerCommand::Shutdown => {
                 for sender in servers.values() {
                     let _ = sender.send(ServerMessage::Shutdown);
@@ -681,12 +852,32 @@ fn initialize(
                 "rootUri": root_uri,
                 "workspaceFolders": [{"uri": root_uri, "name": root_name}],
                 "capabilities": {
-                    "workspace": {"workspaceFolders": true, "configuration": true},
+                    "workspace": {
+                        "workspaceFolders": true,
+                        "configuration": true,
+                        "workspaceEdit": {"documentChanges": true}
+                    },
                     "textDocument": {
                         "synchronization": {"didSave": true},
                         "completion": {"completionItem": {"snippetSupport": false}},
                         "definition": {"linkSupport": true},
-                        "publishDiagnostics": {"versionSupport": true}
+                        "publishDiagnostics": {"versionSupport": true},
+                        "formatting": {},
+                        "codeAction": {
+                            "codeActionLiteralSupport": {
+                                "codeActionKind": {
+                                    "valueSet": [
+                                        "", "quickfix", "refactor", "refactor.extract",
+                                        "refactor.inline", "refactor.rewrite", "source",
+                                        "source.organizeImports", "source.fixAll"
+                                    ]
+                                }
+                            },
+                            "isPreferredSupport": true,
+                            "disabledSupport": true,
+                            "dataSupport": true,
+                            "resolveSupport": {"properties": ["edit"]}
+                        }
                     }
                 }
             }
@@ -734,6 +925,21 @@ enum PendingRequest {
     Rename {
         document_id: u64,
         revision: u64,
+    },
+    Formatting {
+        document_id: u64,
+        revision: u64,
+    },
+    CodeActions {
+        document_id: u64,
+        revision: u64,
+    },
+    ResolveCodeAction {
+        document_id: u64,
+        revision: u64,
+    },
+    ExecuteCommand {
+        document_id: u64,
     },
 }
 
@@ -846,6 +1052,51 @@ fn server_loop(
                             "params": {
                                 "textDocument": {"uri": uri}, "position": position,
                                 "newName": new_name
+                            }
+                        }))?;
+                    }
+                    ServerMessage::Formatting { document_id, revision, uri, tab_size, insert_spaces } => {
+                        let id = next_request_id;
+                        next_request_id += 1;
+                        pending.insert(id, PendingRequest::Formatting { document_id, revision });
+                        write_message(stdin, &json!({
+                            "jsonrpc": "2.0", "id": id, "method": "textDocument/formatting",
+                            "params": {
+                                "textDocument": {"uri": uri},
+                                "options": {"tabSize": tab_size, "insertSpaces": insert_spaces}
+                            }
+                        }))?;
+                    }
+                    ServerMessage::CodeActions { document_id, revision, uri, range, diagnostics } => {
+                        let id = next_request_id;
+                        next_request_id += 1;
+                        pending.insert(id, PendingRequest::CodeActions { document_id, revision });
+                        write_message(stdin, &json!({
+                            "jsonrpc": "2.0", "id": id, "method": "textDocument/codeAction",
+                            "params": {
+                                "textDocument": {"uri": uri}, "range": range,
+                                "context": {"diagnostics": diagnostics}
+                            }
+                        }))?;
+                    }
+                    ServerMessage::ResolveCodeAction { document_id, revision, action } => {
+                        let id = next_request_id;
+                        next_request_id += 1;
+                        pending.insert(id, PendingRequest::ResolveCodeAction { document_id, revision });
+                        write_message(stdin, &json!({
+                            "jsonrpc": "2.0", "id": id, "method": "codeAction/resolve",
+                            "params": action
+                        }))?;
+                    }
+                    ServerMessage::ExecuteCommand { document_id, command } => {
+                        let id = next_request_id;
+                        next_request_id += 1;
+                        pending.insert(id, PendingRequest::ExecuteCommand { document_id });
+                        write_message(stdin, &json!({
+                            "jsonrpc": "2.0", "id": id, "method": "workspace/executeCommand",
+                            "params": {
+                                "command": command.command,
+                                "arguments": command.arguments.unwrap_or_default()
                             }
                         }))?;
                     }
@@ -976,6 +1227,42 @@ fn handle_incoming(
                 revision,
                 edit,
             });
+        }
+        PendingRequest::Formatting {
+            document_id,
+            revision,
+        } => {
+            let edits: Option<Vec<TextEdit>> = serde_json::from_value(result)?;
+            sink.send(LspEvent::Formatting {
+                document_id,
+                revision,
+                edits: edits.unwrap_or_default(),
+            });
+        }
+        PendingRequest::CodeActions {
+            document_id,
+            revision,
+        } => {
+            let actions: Option<CodeActionResponse> = serde_json::from_value(result)?;
+            sink.send(LspEvent::CodeActions {
+                document_id,
+                revision,
+                actions: actions.unwrap_or_default(),
+            });
+        }
+        PendingRequest::ResolveCodeAction {
+            document_id,
+            revision,
+        } => {
+            let action: CodeAction = serde_json::from_value(result)?;
+            sink.send(LspEvent::CodeActionResolved {
+                document_id,
+                revision,
+                action: Box::new(action),
+            });
+        }
+        PendingRequest::ExecuteCommand { document_id } => {
+            sink.send(LspEvent::CommandExecuted { document_id });
         }
     }
     Ok(())

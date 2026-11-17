@@ -76,6 +76,15 @@ struct RenameState {
     revisions: HashMap<u64, u64>,
 }
 
+#[derive(Default)]
+struct CodeActionsState {
+    open: bool,
+    document_id: u64,
+    revision: u64,
+    actions: Vec<lsp_types::CodeActionOrCommand>,
+    revisions: HashMap<u64, u64>,
+}
+
 struct StatusMessage {
     text: String,
     error: bool,
@@ -102,6 +111,7 @@ pub struct FastCodeEditor {
     references_open: bool,
     references: Vec<lsp_types::Location>,
     rename: RenameState,
+    code_actions: CodeActionsState,
     search: SearchState,
     quick_open: QuickOpenState,
     status: Option<StatusMessage>,
@@ -136,6 +146,7 @@ impl FastCodeEditor {
             references_open: false,
             references: Vec::new(),
             rename: RenameState::default(),
+            code_actions: CodeActionsState::default(),
             search: SearchState::default(),
             quick_open: QuickOpenState::default(),
             status: None,
@@ -169,6 +180,43 @@ impl FastCodeEditor {
             self.lsp
                 .request_definition(&open.document, open.editor.cursor);
         }
+    }
+
+    fn request_formatting_active(&self) {
+        if let Some(open) = self.active_document() {
+            self.lsp.request_formatting(&open.document);
+        }
+    }
+
+    fn request_code_actions_active(&mut self) {
+        let Some(open) = self.active_document() else {
+            return;
+        };
+        let (start, end) = open
+            .editor
+            .selection()
+            .unwrap_or((open.editor.cursor, open.editor.cursor));
+        let range = lsp_types::Range {
+            start: open.document.to_lsp_position(start),
+            end: open.document.to_lsp_position(end),
+        };
+        let diagnostics = diagnostics_for_range(&open.editor.diagnostics, range);
+        let document_id = open.document.id;
+        let revision = open.document.revision;
+        let revisions = self
+            .documents
+            .iter()
+            .map(|open| (open.document.id, open.document.revision))
+            .collect();
+        self.lsp
+            .request_code_actions(&open.document, start, end, diagnostics);
+        self.code_actions = CodeActionsState {
+            open: false,
+            document_id,
+            revision,
+            actions: Vec::new(),
+            revisions,
+        };
     }
 
     fn request_references_active(&self) {
@@ -289,23 +337,61 @@ impl FastCodeEditor {
         }
     }
 
+    fn apply_formatting(
+        &mut self,
+        document_id: u64,
+        revision: u64,
+        edits: Vec<lsp_types::TextEdit>,
+    ) {
+        let Some(open) = self
+            .documents
+            .iter_mut()
+            .find(|open| open.document.id == document_id)
+        else {
+            return;
+        };
+        if open.document.revision != revision {
+            self.set_error("Документ изменился во время форматирования. Правки не применены");
+            return;
+        }
+        if edits.is_empty() {
+            self.set_status("Форматирование не требуется");
+            return;
+        }
+        let applied = apply_text_edits(&mut open.document, edits);
+        let cursor = open.document.clamp_position(open.editor.cursor);
+        open.editor.go_to(cursor);
+        if applied > 0 {
+            self.lsp.change(&open.document);
+            self.set_status(format!("Форматирование: {applied} правок"));
+        } else {
+            self.set_status("Форматирование не требуется");
+        }
+    }
+
+    fn revisions_current(
+        &self,
+        document_id: u64,
+        revision: u64,
+        revisions: &HashMap<u64, u64>,
+    ) -> bool {
+        self.documents
+            .iter()
+            .any(|open| open.document.id == document_id && open.document.revision == revision)
+            && self.documents.iter().all(|open| {
+                revisions
+                    .get(&open.document.id)
+                    .is_none_or(|expected| *expected == open.document.revision)
+            })
+    }
+
     fn apply_rename(
         &mut self,
         document_id: u64,
         revision: u64,
         edit: Option<lsp_types::WorkspaceEdit>,
     ) {
-        let stale = !self
-            .documents
-            .iter()
-            .any(|open| open.document.id == document_id && open.document.revision == revision)
-            || self.documents.iter().any(|open| {
-                self.rename
-                    .revisions
-                    .get(&open.document.id)
-                    .is_some_and(|expected| *expected != open.document.revision)
-            });
-        if stale {
+        if !self.revisions_current(document_id, revision, &self.rename.revisions) {
             self.rename.revisions.clear();
             self.set_error("Документы изменились во время rename. Правки не применены");
             return;
@@ -315,15 +401,103 @@ impl FastCodeEditor {
             self.set_status("Сервер не вернул изменения для rename");
             return;
         };
+        let _ = self.apply_workspace_edit(edit, "Rename");
+        self.rename.revisions.clear();
+    }
+
+    fn apply_code_action_edit(
+        &mut self,
+        document_id: u64,
+        revision: u64,
+        edit: Option<lsp_types::WorkspaceEdit>,
+    ) -> bool {
+        if !self.revisions_current(document_id, revision, &self.code_actions.revisions) {
+            self.code_actions.revisions.clear();
+            self.set_error("Документы изменились во время code action. Правки не применены");
+            return false;
+        }
+        let Some(edit) = edit else {
+            self.code_actions.revisions.clear();
+            self.set_status("Code action не содержит текстовых изменений");
+            return true;
+        };
+        let applied = self.apply_workspace_edit(edit, "Code action");
+        self.code_actions.revisions.clear();
+        applied
+    }
+
+    fn execute_code_action(&mut self, index: usize) {
+        let Some(action) = self.code_actions.actions.get(index).cloned() else {
+            return;
+        };
+        self.code_actions.open = false;
+        self.code_actions.actions.clear();
+        if !self.revisions_current(
+            self.code_actions.document_id,
+            self.code_actions.revision,
+            &self.code_actions.revisions,
+        ) {
+            self.code_actions.revisions.clear();
+            self.set_error("Документы изменились. Повторите запрос code actions");
+            return;
+        }
+        match action {
+            lsp_types::CodeActionOrCommand::Command(command) => {
+                let document_id = self.code_actions.document_id;
+                self.code_actions.revisions.clear();
+                self.lsp.execute_command(document_id, command);
+            }
+            lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                self.execute_code_action_value(action, true);
+            }
+        }
+    }
+
+    fn execute_code_action_value(&mut self, action: lsp_types::CodeAction, allow_resolve: bool) {
+        if let Some(disabled) = &action.disabled {
+            self.set_error(format!("Действие недоступно: {}", disabled.reason));
+            return;
+        }
+        let document_id = self.code_actions.document_id;
+        let revision = self.code_actions.revision;
+        if !self.revisions_current(document_id, revision, &self.code_actions.revisions) {
+            self.code_actions.revisions.clear();
+            self.set_error("Документы изменились. Повторите запрос code actions");
+            return;
+        }
+        let command = action.command.clone();
+        if let Some(edit) = action.edit {
+            if !self.apply_code_action_edit(document_id, revision, Some(edit)) {
+                return;
+            }
+            if let Some(command) = command {
+                self.lsp.execute_command(document_id, command);
+            }
+        } else if let Some(command) = command {
+            self.code_actions.revisions.clear();
+            self.lsp.execute_command(document_id, command);
+        } else if allow_resolve && action.data.is_some() {
+            if let Some(open) = self
+                .documents
+                .iter()
+                .find(|open| open.document.id == document_id)
+            {
+                self.lsp.resolve_code_action(&open.document, action);
+            }
+        } else {
+            self.code_actions.revisions.clear();
+            self.set_status("Code action не содержит выполнимой операции");
+        }
+    }
+
+    fn apply_workspace_edit(&mut self, edit: lsp_types::WorkspaceEdit, operation: &str) -> bool {
         let changes = match workspace_text_edits(edit) {
             Ok(changes) => changes,
             Err(error) => {
-                self.rename.revisions.clear();
                 self.set_error(error);
-                return;
+                return false;
             }
         };
-
         let mut changed_documents = Vec::new();
         let mut errors = Vec::new();
         let mut applied = 0_usize;
@@ -339,11 +513,13 @@ impl FastCodeEditor {
                 .find(|open| open.document.path == path)
             {
                 if open.document.lsp_text().is_none() {
-                    errors.push(format!("{} слишком велик для rename", path.display()));
+                    errors.push(format!("{} слишком велик для {operation}", path.display()));
                     continue;
                 }
                 let count = apply_text_edits(&mut open.document, edits);
                 if count > 0 {
+                    let cursor = open.document.clamp_position(open.editor.cursor);
+                    open.editor.go_to(cursor);
                     applied += count;
                     changed_files += 1;
                     changed_documents.push(open.document.id);
@@ -367,7 +543,7 @@ impl FastCodeEditor {
                         }
                     }
                 }
-                Ok(_) => errors.push(format!("{} слишком велик для rename", path.display())),
+                Ok(_) => errors.push(format!("{} слишком велик для {operation}", path.display())),
                 Err(error) => {
                     errors.push(format!("Не удалось открыть {}: {error:#}", path.display()))
                 }
@@ -383,15 +559,18 @@ impl FastCodeEditor {
                 self.lsp.change(&open.document);
             }
         }
-        self.rename.revisions.clear();
-        if errors.is_empty() {
-            self.set_status(format!("Rename: {applied} правок в {changed_files} файлах"));
+        let success = errors.is_empty();
+        if success {
+            self.set_status(format!(
+                "{operation}: {applied} правок в {changed_files} файлах"
+            ));
         } else {
             self.set_error(format!(
-                "Rename выполнен частично ({applied} правок): {}",
+                "{operation} выполнен частично ({applied} правок): {}",
                 errors.join("; ")
             ));
         }
+        success
     }
 
     fn sync_lsp_document(&self, document_id: u64) {
@@ -645,6 +824,12 @@ impl FastCodeEditor {
     fn handle_shortcuts(&mut self, context: &Context) {
         if consume(context, Key::Space, Modifiers::CTRL) {
             self.request_completion_active();
+        }
+        if consume(context, Key::F, Modifiers::SHIFT | Modifiers::ALT) {
+            self.request_formatting_active();
+        }
+        if consume(context, Key::Period, Modifiers::COMMAND) {
+            self.request_code_actions_active();
         }
         if consume(context, Key::F2, Modifiers::NONE) {
             self.start_rename_active();
@@ -900,6 +1085,47 @@ impl FastCodeEditor {
                     revision,
                     edit,
                 } => self.apply_rename(document_id, revision, edit),
+                LspEvent::Formatting {
+                    document_id,
+                    revision,
+                    edits,
+                } => self.apply_formatting(document_id, revision, edits),
+                LspEvent::CodeActions {
+                    document_id,
+                    revision,
+                    mut actions,
+                } => {
+                    if self.code_actions.document_id == document_id
+                        && self.code_actions.revision == revision
+                        && self.documents.iter().any(|open| {
+                            open.document.id == document_id && open.document.revision == revision
+                        })
+                    {
+                        actions.sort_by_key(code_action_priority);
+                        self.code_actions.actions = actions;
+                        self.code_actions.open = true;
+                    }
+                }
+                LspEvent::CodeActionResolved {
+                    document_id,
+                    revision,
+                    action,
+                } => {
+                    if self.code_actions.document_id == document_id
+                        && self.code_actions.revision == revision
+                    {
+                        self.execute_code_action_value(*action, false);
+                    }
+                }
+                LspEvent::CommandExecuted { document_id } => {
+                    if self
+                        .documents
+                        .iter()
+                        .any(|open| open.document.id == document_id)
+                    {
+                        self.set_status("Команда LSP выполнена");
+                    }
+                }
             }
         }
 
@@ -1007,6 +1233,18 @@ impl FastCodeEditor {
                     if ui.button("Автодополнение    Ctrl+Space").clicked() {
                         ui.close();
                         self.request_completion_active();
+                    }
+                    if ui.button("Форматировать документ    Shift+Alt+F").clicked()
+                    {
+                        ui.close();
+                        self.request_formatting_active();
+                    }
+                    if ui
+                        .button("Code Actions / Quick Fix    Cmd/Ctrl+.")
+                        .clicked()
+                    {
+                        ui.close();
+                        self.request_code_actions_active();
                     }
                     if ui.button("Перейти к определению    F12").clicked() {
                         ui.close();
@@ -1321,6 +1559,51 @@ impl FastCodeEditor {
         }
         if close {
             self.references_open = false;
+        }
+    }
+
+    fn show_code_actions(&mut self, context: &Context) {
+        if !self.code_actions.open {
+            return;
+        }
+        let mut open = true;
+        let mut selected = None;
+        egui::Window::new("Code Actions")
+            .open(&mut open)
+            .anchor(Align2::CENTER_TOP, [0.0, 100.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .show(context, |ui| {
+                if self.code_actions.actions.is_empty() {
+                    ui.label("Доступные действия не найдены");
+                    return;
+                }
+                ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                    for (index, action) in self.code_actions.actions.iter().enumerate() {
+                        let title = code_action_title(action);
+                        let preferred = matches!(
+                            action,
+                            lsp_types::CodeActionOrCommand::CodeAction(action)
+                                if action.is_preferred == Some(true)
+                        );
+                        let response = ui.selectable_label(
+                            false,
+                            if preferred {
+                                RichText::new(title).strong()
+                            } else {
+                                RichText::new(title)
+                            },
+                        );
+                        if response.clicked() {
+                            selected = Some(index);
+                        }
+                    }
+                });
+            });
+        self.code_actions.open = open;
+        if let Some(index) = selected {
+            self.execute_code_action(index);
         }
     }
 
@@ -1710,6 +1993,7 @@ impl eframe::App for FastCodeEditor {
             self.sync_lsp_document(document_id);
         }
         self.show_quick_open(context);
+        self.show_code_actions(context);
         self.show_rename(context);
         self.show_close_confirmation(context);
         let compaction_pending = self.maybe_start_compaction(context);
@@ -1760,6 +2044,61 @@ fn search_snapshot(
         }
     }
     results
+}
+
+fn diagnostics_for_range(
+    diagnostics: &[lsp_types::Diagnostic],
+    range: lsp_types::Range,
+) -> Vec<lsp_types::Diagnostic> {
+    fn key(position: lsp_types::Position) -> (u32, u32) {
+        (position.line, position.character)
+    }
+
+    diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            key(diagnostic.range.start) <= key(range.end)
+                && key(range.start) <= key(diagnostic.range.end)
+        })
+        .cloned()
+        .collect()
+}
+
+fn code_action_priority(action: &lsp_types::CodeActionOrCommand) -> (bool, u8) {
+    let lsp_types::CodeActionOrCommand::CodeAction(action) = action else {
+        return (false, 2);
+    };
+    let quick_fix = action.kind.as_ref().is_some_and(|kind| {
+        kind.as_str() == lsp_types::CodeActionKind::QUICKFIX.as_str()
+            || kind.as_str().starts_with("quickfix.")
+    });
+    let group = if action.is_preferred == Some(true) {
+        0
+    } else if quick_fix {
+        1
+    } else {
+        2
+    };
+    (action.disabled.is_some(), group)
+}
+
+fn code_action_title(action: &lsp_types::CodeActionOrCommand) -> String {
+    match action {
+        lsp_types::CodeActionOrCommand::Command(command) => command.title.clone(),
+        lsp_types::CodeActionOrCommand::CodeAction(action) => {
+            let kind = action
+                .kind
+                .as_ref()
+                .map(|kind| kind.as_str())
+                .unwrap_or("action");
+            let disabled = action
+                .disabled
+                .as_ref()
+                .map(|disabled| format!(" — недоступно: {}", disabled.reason))
+                .unwrap_or_default();
+            format!("{} — {kind}{disabled}", action.title)
+        }
+    }
 }
 
 fn identifier_at(document: &Document, position: Position) -> String {
@@ -1824,17 +2163,19 @@ fn workspace_text_edits(
     Ok(result)
 }
 
-fn apply_text_edits(document: &mut Document, mut edits: Vec<lsp_types::TextEdit>) -> usize {
-    edits.sort_by(|left, right| {
+fn apply_text_edits(document: &mut Document, edits: Vec<lsp_types::TextEdit>) -> usize {
+    let mut edits: Vec<_> = edits.into_iter().enumerate().collect();
+    edits.sort_by(|(left_index, left), (right_index, right)| {
         right
             .range
             .start
             .line
             .cmp(&left.range.start.line)
             .then_with(|| right.range.start.character.cmp(&left.range.start.character))
+            .then_with(|| right_index.cmp(left_index))
     });
     let mut applied = 0;
-    for edit in edits {
+    for (_, edit) in edits {
         let start = document.from_lsp_position(edit.range.start);
         let end = document.from_lsp_position(edit.range.end);
         if start <= end && document.replace(start, end, &edit.new_text).is_some() {
@@ -1958,6 +2299,80 @@ mod tests {
         assert_eq!(apply_text_edits(&mut document, edits), 2);
         assert_eq!(document.line(0), "fn renamed() {}");
         assert_eq!(document.line(1), "fn main() { renamed(); }");
+    }
+
+    #[test]
+    fn quick_fix_document_changes_are_applied() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "int value = 0").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open(file.path(), 80).unwrap();
+        let uri = url::Url::from_file_path(file.path()).unwrap();
+        let edit = lsp_types::WorkspaceEdit {
+            document_changes: Some(lsp_types::DocumentChanges::Edits(vec![
+                lsp_types::TextDocumentEdit {
+                    text_document: lsp_types::OptionalVersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: Some(1),
+                    },
+                    edits: vec![lsp_types::OneOf::Left(lsp_types::TextEdit::new(
+                        lsp_types::Range::new(
+                            lsp_types::Position::new(0, 13),
+                            lsp_types::Position::new(0, 13),
+                        ),
+                        ";".into(),
+                    ))],
+                },
+            ])),
+            ..lsp_types::WorkspaceEdit::default()
+        };
+
+        let changes = workspace_text_edits(edit).unwrap();
+        let edits = changes.into_values().next().unwrap();
+        assert_eq!(apply_text_edits(&mut document, edits), 1);
+        assert_eq!(document.line(0), "int value = 0;");
+    }
+
+    #[test]
+    fn same_position_lsp_insertions_keep_server_order() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "ab").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open(file.path(), 79).unwrap();
+        let position = lsp_types::Position::new(0, 1);
+        let edits = vec![
+            lsp_types::TextEdit::new(lsp_types::Range::new(position, position), "A".into()),
+            lsp_types::TextEdit::new(lsp_types::Range::new(position, position), "B".into()),
+        ];
+
+        assert_eq!(apply_text_edits(&mut document, edits), 2);
+        assert_eq!(document.line(0), "aABb");
+    }
+
+    #[test]
+    fn code_action_diagnostics_are_limited_to_the_requested_range() {
+        let diagnostic = |line| lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(line, 2),
+                lsp_types::Position::new(line, 8),
+            ),
+            ..lsp_types::Diagnostic::default()
+        };
+        let diagnostics = vec![diagnostic(0), diagnostic(2), diagnostic(4)];
+        let selected = diagnostics_for_range(
+            &diagnostics,
+            lsp_types::Range::new(
+                lsp_types::Position::new(2, 5),
+                lsp_types::Position::new(2, 5),
+            ),
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].range.start.line, 2);
     }
 
     #[test]

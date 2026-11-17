@@ -162,3 +162,78 @@ fn clangd_hover_references_and_rename() {
     assert!(rename_found, "rename missing; statuses: {statuses:?}");
     drop(worker);
 }
+
+#[test]
+#[ignore = "requires clangd"]
+fn clangd_formatting_and_quick_fix() {
+    let project = tempfile::tempdir().unwrap();
+    let main_path = project.path().join("main.cpp");
+    fs::write(&main_path, "int main(){int value=0\nreturn value;}\n").unwrap();
+    let main_path = fs::canonicalize(main_path).unwrap();
+
+    let document = Document::open(&main_path, 704).unwrap();
+    let worker = LspWorker::new(&egui::Context::default());
+    worker.open(&document, Some(project.path().to_path_buf()));
+
+    let started = Instant::now();
+    let mut formatting_requested = false;
+    let mut actions_requested = false;
+    let mut formatting_found = false;
+    let mut quick_fix_found = false;
+    let mut statuses = Vec::new();
+
+    while started.elapsed() < Duration::from_secs(30) && !(formatting_found && quick_fix_found) {
+        if let Some(event) = worker.try_recv() {
+            match event {
+                LspEvent::ServerStatus { message, error } => {
+                    statuses.push(message.clone());
+                    assert!(!error, "LSP error: {message}");
+                    if message.contains("подключён") && !formatting_requested {
+                        worker.request_formatting(&document);
+                        formatting_requested = true;
+                    }
+                }
+                LspEvent::Diagnostics { diagnostics, .. } if !actions_requested => {
+                    if let Some(diagnostic) = diagnostics
+                        .iter()
+                        .find(|diagnostic| {
+                            diagnostic.message.to_lowercase().contains("expected ';'")
+                        })
+                        .cloned()
+                    {
+                        worker.request_code_actions(
+                            &document,
+                            document.from_lsp_position(diagnostic.range.start),
+                            document.from_lsp_position(diagnostic.range.end),
+                            vec![diagnostic],
+                        );
+                        actions_requested = true;
+                    }
+                }
+                LspEvent::Formatting { edits, .. } => {
+                    formatting_found |= !edits.is_empty();
+                }
+                LspEvent::CodeActions { actions, .. } => {
+                    quick_fix_found |= actions.iter().any(|action| match action {
+                        lsp_types::CodeActionOrCommand::CodeAction(action) => {
+                            action.kind.as_ref().is_some_and(|kind| {
+                                kind.as_str() == lsp_types::CodeActionKind::QUICKFIX.as_str()
+                            }) && action.edit.is_some()
+                        }
+                        _ => false,
+                    });
+                }
+                _ => {}
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    assert!(
+        formatting_found,
+        "formatting missing; statuses: {statuses:?}"
+    );
+    assert!(quick_fix_found, "quick fix missing; statuses: {statuses:?}");
+    drop(worker);
+}
