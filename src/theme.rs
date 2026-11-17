@@ -1,5 +1,7 @@
 use eframe::egui::{
-    Color32, Context, CornerRadius, FontId, Margin, Shadow, Stroke, TextStyle, Vec2, Visuals,
+    Color32, Context, CornerRadius, FontData, FontFamily, FontId, Margin, Shadow, Stroke,
+    TextStyle, Vec2, Visuals,
+    epaint::text::{FontInsert, FontPriority, InsertFontFamily},
 };
 
 const fn premultiply(channel: u8, alpha: u8) -> u8 {
@@ -19,7 +21,9 @@ pub const TEXT: Color32 = Color32::from_rgb(224, 231, 255);
 pub const MUTED: Color32 = Color32::from_rgb(129, 140, 168);
 pub const INDIGO: Color32 = Color32::from_rgb(129, 140, 248);
 pub const CYAN: Color32 = Color32::from_rgb(56, 189, 248);
+pub const VIOLET: Color32 = Color32::from_rgb(167, 139, 250);
 pub const ERROR: Color32 = Color32::from_rgb(251, 113, 133);
+pub const WARNING: Color32 = Color32::from_rgb(251, 191, 36);
 pub const EDITOR_TEXT: Color32 = Color32::from_rgb(221, 230, 255);
 pub const EDITOR_MUTED: Color32 = Color32::from_rgb(102, 119, 156);
 pub const CURSOR: Color32 = Color32::from_rgb(125, 211, 252);
@@ -32,6 +36,25 @@ const WINDOW: Color32 = rgba(15, 25, 50, 238);
 const SURFACE: Color32 = rgba(20, 32, 61, 225);
 const SURFACE_HOVER: Color32 = rgba(35, 49, 88, 235);
 const BORDER: Color32 = rgba(99, 116, 163, 80);
+
+pub fn install_material_symbols(context: &Context) {
+    let mut data = FontData::from_static(egui_material_icons::FONT_DATA);
+    data.tweak.y_offset_factor = 0.05;
+    context.add_font(FontInsert::new(
+        "material-icons",
+        data,
+        vec![
+            InsertFontFamily {
+                family: FontFamily::Proportional,
+                priority: FontPriority::Lowest,
+            },
+            InsertFontFamily {
+                family: FontFamily::Monospace,
+                priority: FontPriority::Lowest,
+            },
+        ],
+    ));
+}
 
 pub fn apply(context: &Context) {
     let mut style = (*context.style()).clone();
@@ -102,4 +125,27 @@ pub fn apply(context: &Context) {
     ]
     .into();
     context.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn material_symbols_are_available_in_monospace_ui() {
+        let context = Context::default();
+        install_material_symbols(&context);
+        let _ = context.run(eframe::egui::RawInput::default(), |context| {
+            context.fonts(|fonts| {
+                for icon in [
+                    egui_material_icons::icons::ICON_FOLDER,
+                    egui_material_icons::icons::ICON_CODE,
+                ] {
+                    assert!(
+                        fonts.has_glyph(&FontId::monospace(13.0), icon.chars().next().unwrap(),)
+                    );
+                }
+            });
+        });
+    }
 }

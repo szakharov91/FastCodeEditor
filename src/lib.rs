@@ -1,7 +1,9 @@
 pub mod app;
 pub mod document;
 pub mod editor;
+pub mod explorer;
 pub mod highlighter;
+pub mod lsp;
 pub mod piece_table;
 pub mod project;
 pub mod theme;

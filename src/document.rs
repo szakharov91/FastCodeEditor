@@ -15,6 +15,7 @@ use crate::piece_table::PieceTable;
 pub const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 pub const HIGHLIGHT_FILE_LIMIT: u64 = 256 * 1024 * 1024;
 pub const MAX_HIGHLIGHT_LINE_BYTES: usize = 16 * 1024;
+pub const LSP_FILE_LIMIT: u64 = 8 * 1024 * 1024;
 const MAX_HISTORY: usize = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
@@ -340,6 +341,45 @@ impl Document {
     pub fn highlighting_allowed(&self) -> bool {
         self.byte_len <= HIGHLIGHT_FILE_LIMIT
     }
+
+    pub fn lsp_text(&self) -> Option<String> {
+        if self.byte_len > LSP_FILE_LIMIT {
+            return None;
+        }
+        match &self.storage {
+            Storage::Rope(rope) => Some(rope.to_string()),
+            Storage::Pieces(pieces) => {
+                let mut bytes = Vec::with_capacity(self.byte_len as usize);
+                pieces.write_to(&mut bytes).ok()?;
+                String::from_utf8(bytes).ok()
+            }
+        }
+    }
+
+    pub fn to_lsp_position(&self, position: Position) -> lsp_types::Position {
+        let position = self.clamp_position(position);
+        let prefix = self.line_slice_chars(position.line, 0, position.column);
+        lsp_types::Position {
+            line: u32::try_from(position.line).unwrap_or(u32::MAX),
+            character: u32::try_from(prefix.chars().map(char::len_utf16).sum::<usize>())
+                .unwrap_or(u32::MAX),
+        }
+    }
+
+    pub fn from_lsp_position(&self, position: lsp_types::Position) -> Position {
+        let line = min(position.line as usize, self.len_lines().saturating_sub(1));
+        let target = position.character as usize;
+        let mut utf16_offset = 0;
+        let mut column = 0;
+        for character in self.line(line).chars() {
+            if utf16_offset + character.len_utf16() > target {
+                break;
+            }
+            utf16_offset += character.len_utf16();
+            column += 1;
+        }
+        Position::new(line, column)
+    }
 }
 
 pub fn advance(mut position: Position, text: &str) -> Position {
@@ -393,6 +433,22 @@ fn trim_line_ending(mut text: String) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn lsp_positions_use_utf16_code_units() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "a🚀b\nsecond").unwrap();
+        file.flush().unwrap();
+        let document = Document::open(file.path(), 99).unwrap();
+        let editor_position = Position::new(0, 2);
+        let lsp_position = document.to_lsp_position(editor_position);
+        assert_eq!(lsp_position, lsp_types::Position::new(0, 3));
+        assert_eq!(document.from_lsp_position(lsp_position), editor_position);
+        assert_eq!(
+            document.from_lsp_position(lsp_types::Position::new(0, 4)),
+            Position::new(0, 3)
+        );
+    }
 
     #[test]
     fn position_advance_handles_crlf() {

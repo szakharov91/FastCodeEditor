@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::PathBuf,
     thread,
@@ -12,7 +12,9 @@ use eframe::egui::{self, Align2, Context, Key, Modifiers, RichText, ScrollArea, 
 use crate::{
     document::{Document, DocumentSnapshot, Position, save_snapshot},
     editor::{self, EditorState},
+    explorer::{ProjectExplorer, chevron_icon, file_icon, folder_icon},
     highlighter::{HighlightWorker, language_label},
+    lsp::{LspEvent, LspWorker},
     project::{Project, is_probably_text},
 };
 
@@ -64,6 +66,16 @@ struct QuickOpenState {
     selected: usize,
 }
 
+#[derive(Default)]
+struct RenameState {
+    open: bool,
+    document_id: u64,
+    revision: u64,
+    position: Position,
+    new_name: String,
+    revisions: HashMap<u64, u64>,
+}
+
 struct StatusMessage {
     text: String,
     error: bool,
@@ -75,18 +87,25 @@ pub struct FastCodeEditor {
     next_document_id: u64,
     project: Option<Project>,
     project_started: Instant,
+    explorer: ProjectExplorer,
     event_tx: Sender<AppEvent>,
     event_rx: Receiver<AppEvent>,
     highlighter: HighlightWorker,
+    lsp: LspWorker,
     pending_loads: usize,
     saving: HashSet<u64>,
     compacting: HashSet<u64>,
     close_after_save: HashSet<u64>,
     close_requested: Option<u64>,
     show_sidebar: bool,
+    diagnostics_open: bool,
+    references_open: bool,
+    references: Vec<lsp_types::Location>,
+    rename: RenameState,
     search: SearchState,
     quick_open: QuickOpenState,
     status: Option<StatusMessage>,
+    pending_navigation: Option<(PathBuf, lsp_types::Position)>,
     initial_path: Option<PathBuf>,
 }
 
@@ -94,6 +113,7 @@ impl FastCodeEditor {
     pub fn new(creation_context: &eframe::CreationContext<'_>) -> Self {
         let (event_tx, event_rx) = unbounded();
         crate::theme::apply(&creation_context.egui_ctx);
+        crate::theme::install_material_symbols(&creation_context.egui_ctx);
 
         Self {
             documents: Vec::new(),
@@ -101,18 +121,25 @@ impl FastCodeEditor {
             next_document_id: 1,
             project: None,
             project_started: Instant::now(),
+            explorer: ProjectExplorer::default(),
             event_tx,
             event_rx,
             highlighter: HighlightWorker::new(&creation_context.egui_ctx),
+            lsp: LspWorker::new(&creation_context.egui_ctx),
             pending_loads: 0,
             saving: HashSet::new(),
             compacting: HashSet::new(),
             close_after_save: HashSet::new(),
             close_requested: None,
             show_sidebar: true,
+            diagnostics_open: false,
+            references_open: false,
+            references: Vec::new(),
+            rename: RenameState::default(),
             search: SearchState::default(),
             quick_open: QuickOpenState::default(),
             status: None,
+            pending_navigation: None,
             initial_path: None,
         }
     }
@@ -128,6 +155,284 @@ impl FastCodeEditor {
 
     fn active_document_mut(&mut self) -> Option<&mut OpenDocument> {
         self.active.and_then(|index| self.documents.get_mut(index))
+    }
+
+    fn request_completion_active(&self) {
+        if let Some(open) = self.active_document() {
+            self.lsp
+                .request_completion(&open.document, open.editor.cursor);
+        }
+    }
+
+    fn request_definition_active(&self) {
+        if let Some(open) = self.active_document() {
+            self.lsp
+                .request_definition(&open.document, open.editor.cursor);
+        }
+    }
+
+    fn request_references_active(&self) {
+        if let Some(open) = self.active_document() {
+            self.lsp
+                .request_references(&open.document, open.editor.cursor);
+        }
+    }
+
+    fn start_rename_active(&mut self) {
+        let Some(open) = self.active_document() else {
+            return;
+        };
+        let position = open.editor.cursor;
+        let name = identifier_at(&open.document, position);
+        self.rename = RenameState {
+            open: true,
+            document_id: open.document.id,
+            revision: open.document.revision,
+            position,
+            new_name: name,
+            revisions: self
+                .documents
+                .iter()
+                .map(|open| (open.document.id, open.document.revision))
+                .collect(),
+        };
+    }
+
+    fn submit_rename(&mut self) {
+        let new_name = self.rename.new_name.trim().to_owned();
+        if new_name.is_empty() {
+            self.set_error("Новое имя символа не может быть пустым");
+            return;
+        }
+        let Some(open) = self
+            .documents
+            .iter()
+            .find(|open| open.document.id == self.rename.document_id)
+        else {
+            self.rename.open = false;
+            return;
+        };
+        if open.document.revision != self.rename.revision {
+            self.rename.open = false;
+            self.set_error("Документ изменился. Повторите переименование");
+            return;
+        }
+        self.lsp
+            .request_rename(&open.document, self.rename.position, new_name);
+        self.rename.open = false;
+    }
+
+    fn navigate_to_location(&mut self, context: &Context, location: &lsp_types::Location) {
+        let Ok(path) = location.uri.to_file_path() else {
+            self.set_error("LSP вернул некорректный путь");
+            return;
+        };
+        let lsp_position = location.range.start;
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|open| open.document.path == path)
+        {
+            self.active = Some(index);
+            let position = self.documents[index]
+                .document
+                .from_lsp_position(lsp_position);
+            self.documents[index].editor.go_to(position);
+        } else {
+            self.pending_navigation = Some((path.clone(), lsp_position));
+            self.open_file(path, context);
+        }
+    }
+
+    fn handle_definition(
+        &mut self,
+        context: &Context,
+        document_id: u64,
+        revision: u64,
+        locations: Vec<lsp_types::Location>,
+    ) {
+        if !self
+            .documents
+            .iter()
+            .any(|open| open.document.id == document_id && open.document.revision == revision)
+        {
+            return;
+        }
+        let Some(location) = locations.first() else {
+            self.set_status("Определение не найдено");
+            return;
+        };
+        let Ok(path) = location.uri.to_file_path() else {
+            self.set_error("LSP вернул некорректный путь определения");
+            return;
+        };
+        let lsp_position = location.range.start;
+        if let Some(index) = self
+            .documents
+            .iter()
+            .position(|open| open.document.path == path)
+        {
+            self.active = Some(index);
+            let position = self.documents[index]
+                .document
+                .from_lsp_position(lsp_position);
+            self.documents[index].editor.go_to(position);
+        } else {
+            self.pending_navigation = Some((path.clone(), lsp_position));
+            self.open_file(path, context);
+        }
+        if locations.len() > 1 {
+            self.set_status(format!(
+                "Переход к первому определению из {}",
+                locations.len()
+            ));
+        }
+    }
+
+    fn apply_rename(
+        &mut self,
+        document_id: u64,
+        revision: u64,
+        edit: Option<lsp_types::WorkspaceEdit>,
+    ) {
+        let stale = !self
+            .documents
+            .iter()
+            .any(|open| open.document.id == document_id && open.document.revision == revision)
+            || self.documents.iter().any(|open| {
+                self.rename
+                    .revisions
+                    .get(&open.document.id)
+                    .is_some_and(|expected| *expected != open.document.revision)
+            });
+        if stale {
+            self.rename.revisions.clear();
+            self.set_error("Документы изменились во время rename. Правки не применены");
+            return;
+        }
+        let Some(edit) = edit else {
+            self.rename.revisions.clear();
+            self.set_status("Сервер не вернул изменения для rename");
+            return;
+        };
+        let changes = match workspace_text_edits(edit) {
+            Ok(changes) => changes,
+            Err(error) => {
+                self.rename.revisions.clear();
+                self.set_error(error);
+                return;
+            }
+        };
+
+        let mut changed_documents = Vec::new();
+        let mut errors = Vec::new();
+        let mut applied = 0_usize;
+        let mut changed_files = 0_usize;
+        for (uri, edits) in changes {
+            let Ok(path) = uri.to_file_path() else {
+                errors.push("Некорректный URI в WorkspaceEdit".to_owned());
+                continue;
+            };
+            if let Some(open) = self
+                .documents
+                .iter_mut()
+                .find(|open| open.document.path == path)
+            {
+                if open.document.lsp_text().is_none() {
+                    errors.push(format!("{} слишком велик для rename", path.display()));
+                    continue;
+                }
+                let count = apply_text_edits(&mut open.document, edits);
+                if count > 0 {
+                    applied += count;
+                    changed_files += 1;
+                    changed_documents.push(open.document.id);
+                }
+                continue;
+            }
+
+            match Document::open(&path, u64::MAX) {
+                Ok(mut document) if document.lsp_text().is_some() => {
+                    let count = apply_text_edits(&mut document, edits);
+                    if count > 0 {
+                        match save_snapshot(&document.snapshot(), &path) {
+                            Ok(_) => {
+                                applied += count;
+                                changed_files += 1;
+                            }
+                            Err(error) => errors.push(format!(
+                                "Не удалось сохранить {}: {error:#}",
+                                path.display()
+                            )),
+                        }
+                    }
+                }
+                Ok(_) => errors.push(format!("{} слишком велик для rename", path.display())),
+                Err(error) => {
+                    errors.push(format!("Не удалось открыть {}: {error:#}", path.display()))
+                }
+            }
+        }
+
+        for document_id in changed_documents {
+            if let Some(open) = self
+                .documents
+                .iter()
+                .find(|open| open.document.id == document_id)
+            {
+                self.lsp.change(&open.document);
+            }
+        }
+        self.rename.revisions.clear();
+        if errors.is_empty() {
+            self.set_status(format!("Rename: {applied} правок в {changed_files} файлах"));
+        } else {
+            self.set_error(format!(
+                "Rename выполнен частично ({applied} правок): {}",
+                errors.join("; ")
+            ));
+        }
+    }
+
+    fn sync_lsp_document(&self, document_id: u64) {
+        let Some(open) = self
+            .documents
+            .iter()
+            .find(|open| open.document.id == document_id)
+        else {
+            return;
+        };
+        self.lsp.change(&open.document);
+        let cursor = open.editor.cursor;
+        let prefix = open
+            .document
+            .line_slice_chars(cursor.line, 0, cursor.column);
+        if prefix.chars().next_back().is_some_and(|character| {
+            character.is_alphanumeric() || matches!(character, '_' | '.' | ':')
+        }) {
+            self.lsp.request_completion(&open.document, cursor);
+        }
+    }
+
+    fn apply_pending_navigation(&mut self, path: &std::path::Path) {
+        if !self
+            .pending_navigation
+            .as_ref()
+            .is_some_and(|(pending_path, _)| pending_path == path)
+        {
+            return;
+        }
+        let Some((_, lsp_position)) = self.pending_navigation.take() else {
+            return;
+        };
+        if let Some(open) = self
+            .documents
+            .iter_mut()
+            .find(|open| open.document.path == path)
+        {
+            let position = open.document.from_lsp_position(lsp_position);
+            open.editor.go_to(position);
+        }
     }
 
     fn set_status(&mut self, text: impl Into<String>) {
@@ -147,6 +452,7 @@ impl FastCodeEditor {
     fn open_path(&mut self, path: PathBuf, context: &Context) {
         if path.is_dir() {
             self.project_started = Instant::now();
+            self.explorer.reset();
             self.project = Some(Project::open(path.clone(), context));
             self.set_status(format!("Индексация {}", path.display()));
         } else {
@@ -162,6 +468,7 @@ impl FastCodeEditor {
             .position(|open| open.document.path == path)
         {
             self.active = Some(index);
+            self.apply_pending_navigation(&path);
             return;
         }
         let id = self.next_document_id;
@@ -325,6 +632,7 @@ impl FastCodeEditor {
         else {
             return;
         };
+        self.lsp.close(document_id);
         self.documents.remove(index);
         self.active = match (self.active, self.documents.len()) {
             (_, 0) => None,
@@ -335,6 +643,21 @@ impl FastCodeEditor {
     }
 
     fn handle_shortcuts(&mut self, context: &Context) {
+        if consume(context, Key::Space, Modifiers::CTRL) {
+            self.request_completion_active();
+        }
+        if consume(context, Key::F2, Modifiers::NONE) {
+            self.start_rename_active();
+        }
+        if consume(context, Key::F12, Modifiers::SHIFT) {
+            self.request_references_active();
+        }
+        if consume(context, Key::F12, Modifiers::NONE) {
+            self.request_definition_active();
+        }
+        if consume(context, Key::M, Modifiers::COMMAND | Modifiers::SHIFT) {
+            self.diagnostics_open = !self.diagnostics_open;
+        }
         if consume(context, Key::O, Modifiers::COMMAND) {
             self.open_file_dialog(context);
         }
@@ -374,7 +697,7 @@ impl FastCodeEditor {
         }
     }
 
-    fn poll_events(&mut self) {
+    fn poll_events(&mut self, context: &Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
                 AppEvent::Loaded { result } => {
@@ -388,11 +711,15 @@ impl FastCodeEditor {
                                 document.load_time.as_secs_f64() * 1000.0,
                                 document.backend_label()
                             );
+                            let path = document.path.clone();
+                            let root = self.project.as_ref().map(|project| project.root.clone());
+                            self.lsp.open(&document, root);
                             self.documents.push(OpenDocument {
                                 document,
                                 editor: EditorState::default(),
                             });
                             self.active = Some(self.documents.len() - 1);
+                            self.apply_pending_navigation(&path);
                             self.set_status(message);
                         }
                         Err(error) => self.set_error(error),
@@ -409,6 +736,7 @@ impl FastCodeEditor {
                     match result {
                         Ok(byte_len) => {
                             let mut should_close = false;
+                            let root = self.project.as_ref().map(|project| project.root.clone());
                             if let Some(open) = self
                                 .documents
                                 .iter_mut()
@@ -416,10 +744,15 @@ impl FastCodeEditor {
                             {
                                 if open.document.revision == revision {
                                     open.document.mark_saved(byte_len);
+                                    if !update_path {
+                                        self.lsp.save(&open.document);
+                                    }
                                 }
                                 if update_path {
+                                    self.lsp.close(document_id);
                                     open.document.path = path.clone();
                                     open.editor.invalidate_highlighting();
+                                    self.lsp.open(&open.document, root);
                                 }
                                 should_close = self.close_after_save.remove(&document_id)
                                     && open.document.revision == revision;
@@ -494,8 +827,86 @@ impl FastCodeEditor {
             }
         }
 
-        if let Some(project) = &mut self.project {
-            project.poll(self.project_started);
+        while let Some(event) = self.lsp.try_recv() {
+            match event {
+                LspEvent::ServerStatus { message, error } => {
+                    if error {
+                        self.set_error(message);
+                    } else {
+                        self.set_status(message);
+                    }
+                }
+                LspEvent::Diagnostics {
+                    document_id,
+                    version,
+                    diagnostics,
+                } => {
+                    if let Some(open) = self
+                        .documents
+                        .iter_mut()
+                        .find(|open| open.document.id == document_id)
+                    {
+                        let current = version.is_none_or(|version| {
+                            version >= 1 && (version - 1) as u64 == open.document.revision
+                        });
+                        if current {
+                            open.editor.diagnostics = diagnostics;
+                        }
+                    }
+                }
+                LspEvent::Completion {
+                    document_id,
+                    revision,
+                    items,
+                } => {
+                    if let Some(open) = self.documents.iter_mut().find(|open| {
+                        open.document.id == document_id && open.document.revision == revision
+                    }) {
+                        open.editor.set_completions(items);
+                    }
+                }
+                LspEvent::Definition {
+                    document_id,
+                    revision,
+                    locations,
+                } => self.handle_definition(context, document_id, revision, locations),
+                LspEvent::Hover {
+                    document_id,
+                    revision,
+                    position,
+                    hover,
+                } => {
+                    let text = hover.as_ref().and_then(hover_documentation);
+                    if let Some(open) = self.documents.iter_mut().find(|open| {
+                        open.document.id == document_id && open.document.revision == revision
+                    }) {
+                        open.editor.set_hover(position, text);
+                    }
+                }
+                LspEvent::References {
+                    document_id,
+                    revision,
+                    locations,
+                } => {
+                    if self.documents.iter().any(|open| {
+                        open.document.id == document_id && open.document.revision == revision
+                    }) {
+                        self.references = locations;
+                        self.references_open = true;
+                    }
+                }
+                LspEvent::Rename {
+                    document_id,
+                    revision,
+                    edit,
+                } => self.apply_rename(document_id, revision, edit),
+            }
+        }
+
+        if let Some(project) = &mut self.project
+            && project.poll(self.project_started)
+        {
+            self.explorer.sync(project);
         }
     }
 
@@ -592,11 +1003,32 @@ impl FastCodeEditor {
                         self.search.document_id =
                             self.active_document().map(|open| open.document.id);
                     }
+                    ui.separator();
+                    if ui.button("Автодополнение    Ctrl+Space").clicked() {
+                        ui.close();
+                        self.request_completion_active();
+                    }
+                    if ui.button("Перейти к определению    F12").clicked() {
+                        ui.close();
+                        self.request_definition_active();
+                    }
+                    if ui.button("Найти ссылки    Shift+F12").clicked() {
+                        ui.close();
+                        self.request_references_active();
+                    }
+                    if ui.button("Переименовать символ    F2").clicked() {
+                        ui.close();
+                        self.start_rename_active();
+                    }
                 });
                 ui.menu_button("Вид", |ui| {
                     if ui.button("Проводник    Cmd/Ctrl+B").clicked() {
                         ui.close();
                         self.show_sidebar = !self.show_sidebar;
+                    }
+                    if ui.button("Проблемы    Cmd/Ctrl+Shift+M").clicked() {
+                        ui.close();
+                        self.diagnostics_open = !self.diagnostics_open;
                     }
                     if let Some(open) = self.active_document_mut() {
                         let mut enabled = open.editor.highlight_enabled;
@@ -620,15 +1052,24 @@ impl FastCodeEditor {
         if !self.show_sidebar {
             return;
         }
+        if let Some(project) = &self.project {
+            self.explorer.sync(project);
+        }
+        let active_path = self
+            .active_document()
+            .map(|open| open.document.path.clone());
         let mut open_path = None;
         let mut open_folder = false;
+        let mut toggle_directory = None;
+        let mut filter_changed = false;
         egui::SidePanel::left("project-panel")
             .resizable(true)
-            .default_width(265.0)
-            .width_range(180.0..=480.0)
+            .default_width(285.0)
+            .width_range(210.0..=480.0)
             .show(context, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("Проект");
+                    ui.label(folder_icon(true));
+                    ui.heading("EXPLORER");
                     if ui.small_button("Открыть").clicked() {
                         open_folder = true;
                     }
@@ -638,13 +1079,19 @@ impl FastCodeEditor {
                     ui.label("Папка проекта не открыта");
                     return;
                 };
-                ui.label(RichText::new(project.root.display().to_string()).small());
+                let root_name = project
+                    .root
+                    .file_name()
+                    .map(|name| name.to_string_lossy())
+                    .unwrap_or_else(|| project.root.to_string_lossy());
+                ui.label(RichText::new(root_name).strong());
                 let mut filter = project.filter().to_owned();
                 if ui
                     .add(TextEdit::singleline(&mut filter).hint_text("Фильтр файлов"))
                     .changed()
                 {
                     project.set_filter(filter);
+                    filter_changed = true;
                 }
                 ui.label(
                     RichText::new(if project.scanning {
@@ -656,21 +1103,47 @@ impl FastCodeEditor {
                     .weak(),
                 );
                 ui.separator();
-                let visible = project.visible_indices();
-                ScrollArea::vertical().show_rows(ui, 22.0, visible.len(), |ui, range| {
-                    for row in range {
-                        let file_index = visible[row];
-                        let file = &project.files[file_index];
-                        if ui
-                            .selectable_label(false, &file.relative)
-                            .on_hover_text(file.path.display().to_string())
-                            .clicked()
-                        {
-                            open_path = Some(file.path.clone());
-                        }
+                let rows = self.explorer.rows();
+                ScrollArea::vertical().show_rows(ui, 24.0, rows.len(), |ui, range| {
+                    ui.spacing_mut().button_padding = egui::Vec2::new(5.0, 2.0);
+                    ui.spacing_mut().item_spacing = egui::Vec2::new(4.0, 2.0);
+                    for row_index in range {
+                        let row = &rows[row_index];
+                        ui.horizontal(|ui| {
+                            ui.add_space(row.depth as f32 * 14.0);
+                            if row.is_directory() {
+                                ui.label(chevron_icon(row.expanded));
+                                ui.label(folder_icon(row.expanded));
+                                if ui.selectable_label(false, &row.name).clicked() {
+                                    toggle_directory = Some(row.relative.clone());
+                                }
+                            } else if let Some(file_index) = row.file_index {
+                                let file = &project.files[file_index];
+                                ui.add_space(16.0);
+                                ui.label(file_icon(&file.relative));
+                                if ui
+                                    .selectable_label(
+                                        active_path.as_ref() == Some(&file.path),
+                                        &row.name,
+                                    )
+                                    .on_hover_text(file.path.display().to_string())
+                                    .clicked()
+                                {
+                                    open_path = Some(file.path.clone());
+                                }
+                            }
+                        });
                     }
                 });
             });
+        if let Some(project) = &self.project {
+            if filter_changed {
+                self.explorer.rebuild(project);
+            }
+            if let Some(relative) = toggle_directory {
+                self.explorer.toggle_directory(&relative, project);
+            }
+        }
         if open_folder {
             self.open_folder_dialog(context);
         }
@@ -787,7 +1260,190 @@ impl FastCodeEditor {
         }
     }
 
-    fn show_status(&self, context: &Context) {
+    fn show_references(&mut self, context: &Context) {
+        if !self.references_open {
+            return;
+        }
+        let mut navigate = None;
+        let mut close = false;
+        egui::TopBottomPanel::bottom("references-panel")
+            .resizable(true)
+            .default_height(190.0)
+            .min_height(100.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Ссылки");
+                    ui.label(RichText::new(format!("{} найдено", self.references.len())).weak());
+                    if ui.small_button("×").on_hover_text("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+                ui.separator();
+                if self.references.is_empty() {
+                    ui.label("Ссылки не найдены");
+                    return;
+                }
+                ScrollArea::vertical().show_rows(ui, 24.0, self.references.len(), |ui, range| {
+                    for index in range {
+                        let location = &self.references[index];
+                        let path = location
+                            .uri
+                            .to_file_path()
+                            .unwrap_or_else(|_| PathBuf::from(location.uri.as_str()));
+                        let preview = self
+                            .documents
+                            .iter()
+                            .find(|open| open.document.path == path)
+                            .map(|open| {
+                                open.document
+                                    .line(location.range.start.line as usize)
+                                    .trim()
+                                    .chars()
+                                    .take(100)
+                                    .collect::<String>()
+                            })
+                            .unwrap_or_default();
+                        let text = format!(
+                            "{}:{}:{}  {}",
+                            path.display(),
+                            location.range.start.line + 1,
+                            location.range.start.character + 1,
+                            preview
+                        );
+                        if ui.selectable_label(false, text).clicked() {
+                            navigate = Some(location.clone());
+                        }
+                    }
+                });
+            });
+        if let Some(location) = navigate {
+            self.navigate_to_location(context, &location);
+        }
+        if close {
+            self.references_open = false;
+        }
+    }
+
+    fn show_rename(&mut self, context: &Context) {
+        if !self.rename.open {
+            return;
+        }
+        let mut open = true;
+        let mut submit = false;
+        let mut cancel = false;
+        egui::Window::new("Переименование символа")
+            .open(&mut open)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(420.0)
+            .show(context, |ui| {
+                ui.label("Новое имя символа:");
+                let response = ui.add(
+                    TextEdit::singleline(&mut self.rename.new_name)
+                        .desired_width(380.0)
+                        .lock_focus(true),
+                );
+                response.request_focus();
+                if response.has_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
+                    submit = true;
+                }
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Переименовать").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        self.rename.open = open;
+        if submit {
+            self.submit_rename();
+        } else if cancel || !open {
+            self.rename.open = false;
+            self.rename.revisions.clear();
+        }
+    }
+
+    fn show_diagnostics(&mut self, context: &Context) {
+        if !self.diagnostics_open {
+            return;
+        }
+        let Some(open) = self.active_document() else {
+            return;
+        };
+        let (errors, warnings) = diagnostic_counts(&open.editor.diagnostics);
+        let mut navigate = None;
+        let mut close = false;
+        egui::TopBottomPanel::bottom("diagnostics-panel")
+            .resizable(true)
+            .default_height(170.0)
+            .min_height(90.0)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Проблемы");
+                    ui.label(
+                        RichText::new(format!("{errors} ошибок, {warnings} предупреждений")).weak(),
+                    );
+                    if ui.small_button("×").on_hover_text("Закрыть").clicked() {
+                        close = true;
+                    }
+                });
+                ui.separator();
+                if open.editor.diagnostics.is_empty() {
+                    ui.label("Языковой сервер не сообщил о проблемах");
+                    return;
+                }
+                ScrollArea::vertical().show_rows(
+                    ui,
+                    24.0,
+                    open.editor.diagnostics.len(),
+                    |ui, range| {
+                        for index in range {
+                            let diagnostic = &open.editor.diagnostics[index];
+                            let (icon, color) = diagnostic_icon(diagnostic);
+                            let message: String = diagnostic
+                                .message
+                                .lines()
+                                .next()
+                                .unwrap_or_default()
+                                .chars()
+                                .take(160)
+                                .collect();
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(icon).color(color));
+                                let location = format!(
+                                    "{}:{}",
+                                    diagnostic.range.start.line + 1,
+                                    diagnostic.range.start.character + 1
+                                );
+                                if ui
+                                    .selectable_label(false, format!("{location}  {message}"))
+                                    .on_hover_text(&diagnostic.message)
+                                    .clicked()
+                                {
+                                    navigate = Some(diagnostic.range.start);
+                                }
+                            });
+                        }
+                    },
+                );
+            });
+        if let Some(position) = navigate
+            && let Some(open) = self.active_document_mut()
+        {
+            let position = open.document.from_lsp_position(position);
+            open.editor.go_to(position);
+        }
+        if close {
+            self.diagnostics_open = false;
+        }
+    }
+
+    fn show_status(&mut self, context: &Context) {
+        let mut toggle_diagnostics = false;
         egui::TopBottomPanel::bottom("status-bar").show(context, |ui| {
             ui.horizontal(|ui| {
                 if let Some(open) = self.active_document() {
@@ -797,6 +1453,18 @@ impl FastCodeEditor {
                             .language()
                             .unwrap_or_else(|| language_label(&document.path)),
                     );
+                    ui.separator();
+                    let (errors, warnings) = diagnostic_counts(&open.editor.diagnostics);
+                    if ui
+                        .selectable_label(
+                            self.diagnostics_open,
+                            format!("Ошибки: {errors}  Предупреждения: {warnings}"),
+                        )
+                        .on_hover_text("Показать панель проблем (Cmd/Ctrl+Shift+M)")
+                        .clicked()
+                    {
+                        toggle_diagnostics = true;
+                    }
                     ui.separator();
                     ui.label(format!(
                         "Строка {}, колонка {}",
@@ -830,6 +1498,9 @@ impl FastCodeEditor {
                 }
             });
         });
+        if toggle_diagnostics {
+            self.diagnostics_open = !self.diagnostics_open;
+        }
     }
 
     fn show_quick_open(&mut self, context: &Context) {
@@ -982,18 +1653,29 @@ impl eframe::App for FastCodeEditor {
         if let Some(path) = self.initial_path.take() {
             self.open_path(path, context);
         }
-        self.poll_events();
+        self.poll_events(context);
         self.handle_shortcuts(context);
         self.show_menu(context);
         self.show_search(context);
         self.show_sidebar(context);
+        self.show_references(context);
+        self.show_diagnostics(context);
         self.show_status(context);
         self.show_tabs(context);
 
+        let mut edited_document = None;
+        let mut hover_request = None;
         egui::CentralPanel::default().show(context, |ui| {
             if let Some(active) = self.active {
                 let open = &mut self.documents[active];
+                let revision = open.document.revision;
                 editor::show(ui, &mut open.document, &mut open.editor, &self.highlighter);
+                if open.document.revision != revision {
+                    edited_document = Some(open.document.id);
+                }
+                if let Some(position) = open.editor.take_hover_request() {
+                    hover_request = Some((open.document.id, position));
+                }
             } else {
                 ui.vertical_centered(|ui| {
                     ui.add_space(120.0);
@@ -1016,7 +1698,19 @@ impl eframe::App for FastCodeEditor {
             }
         });
 
+        if let Some((document_id, position)) = hover_request
+            && let Some(open) = self
+                .documents
+                .iter()
+                .find(|open| open.document.id == document_id)
+        {
+            self.lsp.request_hover(&open.document, position);
+        }
+        if let Some(document_id) = edited_document {
+            self.sync_lsp_document(document_id);
+        }
         self.show_quick_open(context);
+        self.show_rename(context);
         self.show_close_confirmation(context);
         let compaction_pending = self.maybe_start_compaction(context);
         if self.pending_loads > 0
@@ -1068,6 +1762,141 @@ fn search_snapshot(
     results
 }
 
+fn identifier_at(document: &Document, position: Position) -> String {
+    let characters: Vec<char> = document.line(position.line).chars().collect();
+    let cursor = position.column.min(characters.len());
+    let is_identifier = |character: char| character.is_alphanumeric() || character == '_';
+    let mut start = cursor;
+    while start > 0 && is_identifier(characters[start - 1]) {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < characters.len() && is_identifier(characters[end]) {
+        end += 1;
+    }
+    characters[start..end].iter().collect()
+}
+
+fn workspace_text_edits(
+    edit: lsp_types::WorkspaceEdit,
+) -> Result<HashMap<url::Url, Vec<lsp_types::TextEdit>>, String> {
+    fn append_document_edit(
+        result: &mut HashMap<url::Url, Vec<lsp_types::TextEdit>>,
+        edit: lsp_types::TextDocumentEdit,
+    ) {
+        let edits = edit.edits.into_iter().map(|edit| match edit {
+            lsp_types::OneOf::Left(edit) => edit,
+            lsp_types::OneOf::Right(edit) => edit.text_edit,
+        });
+        result
+            .entry(edit.text_document.uri)
+            .or_default()
+            .extend(edits);
+    }
+
+    let mut result = HashMap::new();
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            result.entry(uri).or_insert_with(Vec::new).extend(edits);
+        }
+    }
+    if let Some(changes) = edit.document_changes {
+        match changes {
+            lsp_types::DocumentChanges::Edits(edits) => {
+                for edit in edits {
+                    append_document_edit(&mut result, edit);
+                }
+            }
+            lsp_types::DocumentChanges::Operations(operations) => {
+                for operation in operations {
+                    if let lsp_types::DocumentChangeOperation::Edit(edit) = operation {
+                        append_document_edit(&mut result, edit);
+                    } else {
+                        return Err(
+                            "WorkspaceEdit с файловыми операциями пока не поддерживается"
+                                .to_owned(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn apply_text_edits(document: &mut Document, mut edits: Vec<lsp_types::TextEdit>) -> usize {
+    edits.sort_by(|left, right| {
+        right
+            .range
+            .start
+            .line
+            .cmp(&left.range.start.line)
+            .then_with(|| right.range.start.character.cmp(&left.range.start.character))
+    });
+    let mut applied = 0;
+    for edit in edits {
+        let start = document.from_lsp_position(edit.range.start);
+        let end = document.from_lsp_position(edit.range.end);
+        if start <= end && document.replace(start, end, &edit.new_text).is_some() {
+            applied += 1;
+        }
+    }
+    applied
+}
+
+fn hover_documentation(hover: &lsp_types::Hover) -> Option<String> {
+    fn marked_text(value: &lsp_types::MarkedString) -> &str {
+        match value {
+            lsp_types::MarkedString::String(text) => text,
+            lsp_types::MarkedString::LanguageString(code) => &code.value,
+        }
+    }
+
+    let sections: Vec<&str> = match &hover.contents {
+        lsp_types::HoverContents::Markup(content) => vec![content.value.as_str()],
+        lsp_types::HoverContents::Scalar(value) => vec![marked_text(value)],
+        lsp_types::HoverContents::Array(values) => values.iter().map(marked_text).collect(),
+    };
+    let text = sections
+        .into_iter()
+        .filter(|section| !section.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn diagnostic_counts(diagnostics: &[lsp_types::Diagnostic]) -> (usize, usize) {
+    let errors = diagnostics
+        .iter()
+        .filter(|diagnostic| {
+            diagnostic
+                .severity
+                .is_none_or(|severity| severity == lsp_types::DiagnosticSeverity::ERROR)
+        })
+        .count();
+    let warnings = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == Some(lsp_types::DiagnosticSeverity::WARNING))
+        .count();
+    (errors, warnings)
+}
+
+fn diagnostic_icon(diagnostic: &lsp_types::Diagnostic) -> (&'static str, egui::Color32) {
+    match diagnostic.severity {
+        Some(severity) if severity == lsp_types::DiagnosticSeverity::WARNING => (
+            egui_material_icons::icons::ICON_WARNING,
+            crate::theme::WARNING,
+        ),
+        Some(severity)
+            if severity == lsp_types::DiagnosticSeverity::INFORMATION
+                || severity == lsp_types::DiagnosticSeverity::HINT =>
+        {
+            (egui_material_icons::icons::ICON_INFO, crate::theme::CYAN)
+        }
+        _ => (egui_material_icons::icons::ICON_ERROR, crate::theme::ERROR),
+    }
+}
+
 fn format_size(bytes: u64) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -1092,6 +1921,43 @@ mod tests {
         assert_eq!(format_size(512), "512 Б");
         assert_eq!(format_size(1024), "1.0 КиБ");
         assert_eq!(format_size(1024 * 1024), "1.0 МиБ");
+    }
+
+    #[test]
+    fn workspace_rename_applies_edits_without_shifting_ranges() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "fn target() {{}}\nfn main() {{ target(); }}").unwrap();
+        file.flush().unwrap();
+        let mut document = Document::open(file.path(), 78).unwrap();
+        let uri = url::Url::from_file_path(file.path()).unwrap();
+        let edits = vec![
+            lsp_types::TextEdit::new(
+                lsp_types::Range::new(
+                    lsp_types::Position::new(0, 3),
+                    lsp_types::Position::new(0, 9),
+                ),
+                "renamed".into(),
+            ),
+            lsp_types::TextEdit::new(
+                lsp_types::Range::new(
+                    lsp_types::Position::new(1, 12),
+                    lsp_types::Position::new(1, 18),
+                ),
+                "renamed".into(),
+            ),
+        ];
+        let edit = lsp_types::WorkspaceEdit {
+            changes: Some(HashMap::from([(uri, edits)])),
+            ..lsp_types::WorkspaceEdit::default()
+        };
+        let changes = workspace_text_edits(edit).unwrap();
+        let edits = changes.into_values().next().unwrap();
+
+        assert_eq!(apply_text_edits(&mut document, edits), 2);
+        assert_eq!(document.line(0), "fn renamed() {}");
+        assert_eq!(document.line(1), "fn main() { renamed(); }");
     }
 
     #[test]
